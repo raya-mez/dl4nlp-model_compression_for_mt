@@ -1,3 +1,5 @@
+"""This script benchmarks the Llama2 7B model's translation performance on a subset of the WMT24++ multilingual dataset."""
+
 import json
 import torch
 import logging
@@ -7,25 +9,27 @@ from datasets import load_dataset
 from comet import download_model, load_from_checkpoint
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-
+# --- SCRIPT CONFIG ---
+# setup argument parser
 parser = argparse.ArgumentParser(description="Benchmark Llama2 7B")
 parser.add_argument('--scores_path', type=str, default='llama2_7b_scores.json')
 parser.add_argument('--max_tokens', type=int, default=350, help='Maximum number of tokens to generate')
-parser.add_argument('--n_examples', type=int, default=-1, help='Number of examples from the dataset to consider')
-parser.add_argument('--n_langs', type=int, default=-1, help='Number of language pairs from the dataset to consider')
-parser.add_argument('--batch_size', type=int, default=4, help='Batch size for batched generation')
+parser.add_argument('--n_examples', type=int, default=None, help='Number of examples from the dataset to use. Defaults to the size of the dataset')
+# subset of languages chosen to test on (default: 2 of high-, medium-, and low-resource, in order)
+parser.add_argument('--lang_codes', type=str, nargs='+', default=["fr_FR", "de_DE", "it_IT", "hi_IN", "sw_KE", "th_TH"], help='Languages to benchmark translation for. Indicate by their codes.')
+
 args = parser.parse_args()
 
 max_tokens = args.max_tokens
 scores_path = args.scores_path
 n_examples = args.n_examples
-n_langs = args.n_langs
-batch_size = args.batch_size
+lang_codes = args.lang_codes
 
-logging.basicConfig(level=logging.INFO)
-logging.info(f"Running LLaMA2-7b benchmark with max_tokens={max_tokens}, n_examples={n_examples}, n_langs={n_langs}, batch_size={batch_size}")
+logging.basicConfig(level='INFO')
+logging.info(f"Running LLaMA2-7b benchmark with max_tokens={max_tokens}, n_examples={n_examples}, lang_codes={lang_codes}")
 
-# --- DATASET ---
+
+# --- DATA CONFIG ---
 # dataset constants
 LANGUAGE_BY_CODE = {
     "ar_EG": "Arabic",
@@ -95,19 +99,24 @@ LANGUAGE_PAIRS = (
     "en-tr_TR", "en-uk_UA", "en-ur_PK", "en-vi_VN", "en-zh_CN", "en-zh_TW", "en-zu_ZA",
 )
 
+# subset of language pairs from the dataset to use for testing given specified lang_codes
+lang_pairs = [f"en-{lc}" for lc in lang_codes]
+
+
+# --- MODEL ---
 # load LLaMA2-7b & tokenizer
 model_name = "meta-llama/Llama-2-7b-hf"
-model = AutoModelForCausalLM.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-# ensure pad token exists for batched padding
-if tokenizer.pad_token_id is None:
-    tokenizer.pad_token = tokenizer.eos_token
 model.eval()
+# ---
 
+# --- TRANSLATE() ---
 # function to generate and decode translations
 def translate(src_text, src_lang, tgt_lang):  
     # prompt = f"{src_lang}: {src_text}\n{tgt_lang}: "
-    prompt = f"Translate this from {src_lang} to {tgt_lang}:\n {src_lang}: {src_text}\n {tgt_lang}:"
+    prompt = f"Translate this from {src_lang} to {tgt_lang}:\n {src_lang}: {src_text}\n {tgt_lang}:" # based on Schmidtová et al. (2025)'s Prompt 3 (achieving highest COMET scores when non-perturbed)
+    
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
@@ -117,96 +126,93 @@ def translate(src_text, src_lang, tgt_lang):
             num_beams=5, 
             early_stopping=True
         )
+    
     # decode only the generated tokens after the prompt tokens
     generated_tokens = outputs[:, inputs["input_ids"].shape[-1] :]
     decoded = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+    
     return decoded
+# ---
 
-# batched translation
-def translate_batch(src_texts, src_lang, tgt_lang):
-    prompts = [
-        f"Translate this from {src_lang} to {tgt_lang}:\n {src_lang}: {text}\n {tgt_lang}:"
-        for text in src_texts
-    ]
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            num_beams=5,
-            early_stopping=True
-        )
-    # decode only the generated tokens after prompt tokens per sample
-    input_lengths = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1)
-    decoded = []
-    for i in range(outputs.size(0)):
-        gen_tokens = outputs[i, input_lengths[i]:]
-        decoded.append(tokenizer.decode(gen_tokens, skip_special_tokens=True))
-    return decoded
 
+# --- LOAD COMET ---
+# COMET model for translation evaluation
 comet_model_name = "Unbabel/wmt22-comet-da" 
 model_path = download_model(comet_model_name)
 comet_model = load_from_checkpoint(model_path)
+# ---
+
 
 # dictionary that will store evaluation scores
 scores = {}
 
+# --- INFERENCE LOOP ---
 # iterate over all lang pairs, generate, and evaluate translations
-for lang_pair in LANGUAGE_PAIRS[:n_langs]: 
-    logging.info(f"Running benchmark for language pair: {lang_pair}...")
+for l_code, l_pair in zip(lang_codes, lang_pairs): 
+    logging.info(f"Running benchmark for language pair: {l_pair}...")
 
+    # --- PREP DATA ---
     # load dataset for specified lang pair
-    target_lang_code = lang_pair.split("-")[-1]
-    target_lang = LANGUAGE_BY_CODE[target_lang_code]
-    dataset = load_dataset("google/wmt24pp", lang_pair)['train'] # only 'train' dataset available (instances are called 'test-xxx")
+    dataset = load_dataset("google/wmt24pp", l_pair)['train'] # only 'train' dataset available (instances are called 'test-xxx")
+    target_lang = LANGUAGE_BY_CODE[l_code]
 
-    # prep source & reference instances, skipping sources where 'is_bad_source' is True
+    # prep source & reference examples, skipping sources where 'is_bad_source' is True
     sources = []
     targets = []
-    for src, tgt, is_bad_source in zip(dataset['source'], dataset['target'], dataset['is_bad_source']):
-        if not is_bad_source:
-            sources.append(src)
-            targets.append(tgt)
-
-    # generate & store predictions (batched)
     predictions = []
-    effective_n = len(sources[:n_examples]) if n_examples != -1 else len(sources)
-    for start in range(0, effective_n, batch_size):
-        end = min(start + batch_size, effective_n)
-        batch_src = sources[start:end]
-        batch_preds = translate_batch(batch_src, "English", target_lang)
-        predictions.extend(batch_preds)
-        # keep previous logging of first 5 examples
-        for j, pred in enumerate(batch_preds):
-            global_index = start + j
-            if global_index < 5:
-                logging.info(
-                    f"Model output for example {global_index + 1}:\n{pred}\nSource: {sources[global_index]}\nTarget: {targets[global_index]}"
-                )
+    prediction_ids = []
 
-    # compute chrF score
+    # --- GENERATE ---
+    # generate & store predictions   
+    for i, ex in enumerate(dataset):
+        if n_examples is not None and len(predictions) == n_examples:
+            break
+        if i % 100 == 0:
+            logging.info(f"\nTranslation iteration {i}/{n_examples if n_examples else len(dataset)}...")
+        if not ex['is_bad_source'] == True:
+            translation = translate(ex['source'], "English", target_lang)
+            predictions.append(translation) 
+            prediction_ids.append(ex['segment_id'])
+            sources.append(ex['source'])
+            targets.append(ex['target'])
+    
+    # --- SAVING PREDICTIONS ---
+    # write predictions and corresponding segment_id's to a file
+    pred_out_path = f"predictions_{l_pair}.txt"
+    with open(pred_out_path, "w", encoding="utf-8") as pred_file:
+        for id, pred in zip(prediction_ids, predictions):
+            pred_file.write(f"{id}\t{pred}\n")
+    logging.info(f"Saved predictions to {pred_out_path}")
+
+    # --- EVAL ---
+    # compute chrF++ score
     chrf = evaluate.load("chrf")
     chrf_score = chrf.compute(
         predictions=predictions, 
-        references=targets[:n_examples],
-        word_order=2
+        references=targets,
+        word_order=2  # for chrF++ score
         )
     logging.info(f"chrF++ score: {chrf_score}")
     
     # compute COMET score
     comet_data = [
         {"src": src, "mt": pred, "ref": ref}
-        for src, pred, ref in zip(sources[:n_examples], predictions, targets[:n_examples])
+        for src, pred, ref in zip(sources, predictions, targets)
     ]
-    comet_score = comet_model.predict(comet_data).system_score
+    comet_score = comet_model.predict(comet_data, gpus=1).system_score  # overall score (instead of scores for individual examples)
     logging.info(f"COMET score: {comet_score}")
-    examples = len(sources[:n_examples])
 
     # store chrF & COMET scores for the current lang
-    scores[lang_pair] = (examples, chrf_score, comet_score)
+    scores[l_pair] = {
+        "num_predictions": len(predictions),
+        "chrf_score": chrf_score['score'],
+        "comet_score": comet_score
+    }
+# ---
 
+# --- SAVING EVAL SCORES ---
 # write scores to json file
 with open(scores_path, "w", encoding="utf-8") as f:
     json.dump(scores, f)
 
-logging.info(f"Saved chrF++ & COMET scores for all lang pairs in {scores_path}")
+logging.info(f"Saved chrF++ and COMET scores in {scores_path}")
