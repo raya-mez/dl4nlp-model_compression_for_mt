@@ -26,3 +26,5 @@ dependencies:
     - matplotlib>=3.9.2
     - seaborn>=0.13.2
     - ipywidgets>=8.1.2
+    - unbabel-comet
+    - sacrebleu
