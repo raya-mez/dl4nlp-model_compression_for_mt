@@ -1,0 +1,7 @@
+{
+  "pair": "en-fr_FR",
+  "precision": "int8",
+  "samples": 500,
+  "COMET": 0.848183906853199,
+  "CHRF++": 59.92296183775457
+}
