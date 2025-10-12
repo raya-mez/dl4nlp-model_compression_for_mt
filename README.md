@@ -1,6 +1,6 @@
 # Lost-in-compression
 
-![Quantization Effect](results/summary_plot_tower.png)
+![Animation](results/results_gif.gif)
 
 Welcome to the official repository for our DL4NLP project "**Lost-in-compression**", a project to determine the impact of quantization on the performance of pretrained translation models on different languages (grouped by resource availablity).
 
